@@ -41,6 +41,20 @@ type Store interface {
 	// GetGlobalStats returns aggregate counts across all tracked contracts.
 	// Computed with a single SQL query.
 	GetGlobalStats(ctx context.Context) (GlobalStats, error)
+
+	// RecordContractVersion appends a new entry to the contract_versions table
+	// if the given wasm_hash has not been seen before for this contract.
+	// It is a no-op (returns nil) when the (contract_id, wasm_hash) pair already
+	// exists, making repeated indexer calls idempotent.
+	RecordContractVersion(ctx context.Context, v ContractVersion) error
+
+	// ListContractVersions returns all recorded Wasm hash entries for the given
+	// contract, sorted chronologically by first_seen_ledger ascending.
+	ListContractVersions(ctx context.Context, contractID string) ([]ContractVersion, error)
+
+	// GetLatestContractVersion returns the most recently seen ContractVersion for
+	// the given contract. Returns ErrNotFound when no version has been recorded yet.
+	GetLatestContractVersion(ctx context.Context, contractID string) (ContractVersion, error)
 }
 
 // NewStore returns a Store backed by the given pgxpool.Pool.

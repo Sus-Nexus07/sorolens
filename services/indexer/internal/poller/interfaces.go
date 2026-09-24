@@ -11,7 +11,13 @@ type RPCClient interface {
 	GetLatestLedger(ctx context.Context) (*LatestLedger, error)
 	GetEvents(ctx context.Context, startLedger, endLedger uint32, filters []EventFilter) (*GetEventsResult, error)
 	GetTransaction(ctx context.Context, hash string) (*TransactionResult, error)
+	// GetContractWasmHash returns the current Wasm hash for the given contract
+	// by reading the ContractInstance ledger entry. Returns an empty string
+	// when the contract exists but its Wasm hash cannot be determined, and an
+	// error only on hard RPC/transport failures.
+	GetContractWasmHash(ctx context.Context, contractID string) (string, error)
 }
+
 
 // Store is the subset of the data store the poller needs.
 // The concrete implementation is store.postgresStore from apps/api.
@@ -21,6 +27,12 @@ type Store interface {
 	BatchInsertInvocations(ctx context.Context, invocations []Invocation) error
 	GetSyncState(ctx context.Context, contractID string) (SyncState, error)
 	UpsertSyncState(ctx context.Context, s SyncState) error
+	// RecordContractVersion persists a detected Wasm hash transition.
+	// Implementations must be idempotent for duplicate (contractID, wasmHash) pairs.
+	RecordContractVersion(ctx context.Context, v ContractVersion) error
+	// GetLatestContractVersion returns the most recently recorded ContractVersion
+	// for the given contractID, or (ContractVersion{}, ErrVersionNotFound) if none.
+	GetLatestContractVersion(ctx context.Context, contractID string) (ContractVersion, error)
 }
 
 // RedisClient is the subset of Redis operations the poller needs for advisory locks.
@@ -115,3 +127,20 @@ type SyncState struct {
 	ContractID string
 	LastLedger uint32
 }
+
+// ContractVersion mirrors store.ContractVersion.
+type ContractVersion struct {
+	ContractID        string
+	WasmHash          string
+	FirstSeenLedger   int64
+	TxHash            string
+	VerifiedSourceRef string
+}
+
+// ErrVersionNotFound is returned by GetLatestContractVersion when no entry exists.
+var ErrVersionNotFound = errorString("poller: contract version not found")
+
+// errorString is a trivial error type so the package has no external deps.
+type errorString string
+
+func (e errorString) Error() string { return string(e) }

@@ -20,6 +20,8 @@ type fakeRPC struct {
 	transactions map[string]*TransactionResult
 	txErr        error
 	eventsCalls  []getEventsCall
+	// wasmHashes maps contract ID to the hash to return from GetContractWasmHash.
+	wasmHashes map[string]string
 }
 
 type getEventsCall struct {
@@ -66,16 +68,28 @@ func (f *fakeRPC) GetTransaction(_ context.Context, hash string) (*TransactionRe
 	return &TransactionResult{Status: "SUCCESS", Ledger: 490000}, nil
 }
 
+func (f *fakeRPC) GetContractWasmHash(_ context.Context, contractID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.wasmHashes != nil {
+		if h, ok := f.wasmHashes[contractID]; ok {
+			return h, nil
+		}
+	}
+	return "", nil
+}
+
 // ---- fake Store -----------------------------------------------------------
 
 type fakeStore struct {
-	mu          sync.Mutex
-	contracts   []Contract
-	syncStates  map[string]SyncState
-	events      []Event
-	invocations []Invocation
-	syncErr     error
-	listErr     error
+	mu           sync.Mutex
+	contracts    []Contract
+	syncStates   map[string]SyncState
+	events       []Event
+	invocations  []Invocation
+	versions     []ContractVersion
+	syncErr      error
+	listErr      error
 }
 
 func newFakeStore(contracts []Contract) *fakeStore {
@@ -125,6 +139,38 @@ func (f *fakeStore) UpsertSyncState(_ context.Context, s SyncState) error {
 	}
 	f.syncStates[s.ContractID] = s
 	return nil
+}
+
+func (f *fakeStore) RecordContractVersion(_ context.Context, v ContractVersion) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Idempotent: deduplicate by (contract_id, wasm_hash).
+	for _, existing := range f.versions {
+		if existing.ContractID == v.ContractID && existing.WasmHash == v.WasmHash {
+			return nil
+		}
+	}
+	f.versions = append(f.versions, v)
+	return nil
+}
+
+func (f *fakeStore) GetLatestContractVersion(_ context.Context, contractID string) (ContractVersion, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var latest ContractVersion
+	found := false
+	for _, v := range f.versions {
+		if v.ContractID == contractID {
+			if !found || v.FirstSeenLedger > latest.FirstSeenLedger {
+				latest = v
+				found = true
+			}
+		}
+	}
+	if !found {
+		return ContractVersion{}, ErrVersionNotFound
+	}
+	return latest, nil
 }
 
 // ---- fake RedisClient -----------------------------------------------------
@@ -397,3 +443,118 @@ func TestPoller_UnknownModeReturnsError(t *testing.T) {
 		t.Fatal("expected error for unknown mode")
 	}
 }
+
+// ---- changelog / version detection tests ----------------------------------
+
+// TestPoller_RecordsNewWasmHash verifies that when the RPC reports a wasm hash
+// for a contract that has no prior version, the poller writes one ContractVersion.
+func TestPoller_RecordsNewWasmHash(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+	const wasmHash = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 500000},
+		wasmHashes:   map[string]string{contractID: wasmHash},
+	}
+
+	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if len(store.versions) != 1 {
+		t.Fatalf("expected 1 ContractVersion, got %d", len(store.versions))
+	}
+	got := store.versions[0]
+	if got.ContractID != contractID {
+		t.Errorf("version.ContractID: want %q, got %q", contractID, got.ContractID)
+	}
+	if got.WasmHash != wasmHash {
+		t.Errorf("version.WasmHash: want %q, got %q", wasmHash, got.WasmHash)
+	}
+}
+
+// TestPoller_DoesNotDuplicateUnchangedHash verifies that a second indexer run
+// with the same wasm hash produces no additional ContractVersion row.
+func TestPoller_DoesNotDuplicateUnchangedHash(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CSTABLE"
+	const wasmHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 498000}
+	// Pre-populate a version so the poller sees it as "no change".
+	store.versions = []ContractVersion{{
+		ContractID:      contractID,
+		WasmHash:        wasmHash,
+		FirstSeenLedger: 490000,
+	}}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 500000},
+		wasmHashes:   map[string]string{contractID: wasmHash},
+	}
+
+	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if len(store.versions) != 1 {
+		t.Errorf("expected 1 ContractVersion (no duplicate), got %d", len(store.versions))
+	}
+}
+
+// TestPoller_DetectsHashTransition verifies that when a contract's wasm hash
+// changes between runs, a new ContractVersion row is appended.
+func TestPoller_DetectsHashTransition(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CUPGRADED"
+	const oldHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
+	store.versions = []ContractVersion{{
+		ContractID:      contractID,
+		WasmHash:        oldHash,
+		FirstSeenLedger: 490000,
+	}}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 500000},
+		wasmHashes:   map[string]string{contractID: newHash},
+	}
+
+	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	store.mu.Lock()
+	count := len(store.versions)
+	store.mu.Unlock()
+
+	if count != 2 {
+		t.Fatalf("expected 2 ContractVersions after upgrade, got %d", count)
+	}
+	// The newest entry should carry the new hash.
+	latest, _ := store.GetLatestContractVersion(context.Background(), contractID)
+	if latest.WasmHash != newHash {
+		t.Errorf("latest version WasmHash: want %q, got %q", newHash, latest.WasmHash)
+	}
+}
+

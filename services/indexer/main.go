@@ -85,6 +85,10 @@ func (s *stubRPC) GetTransaction(ctx context.Context, hash string) (*poller.Tran
 	}
 	return &poller.TransactionResult{}, nil
 }
+func (s *stubRPC) GetContractWasmHash(_ context.Context, _ string) (string, error) {
+	// Stub returns empty string; no version detection without real RPC.
+	return "", nil
+}
 
 type stubStore struct{}
 
@@ -102,6 +106,12 @@ func (s *stubStore) GetSyncState(ctx context.Context, contractID string) (poller
 }
 func (s *stubStore) UpsertSyncState(ctx context.Context, state poller.SyncState) error {
 	return nil
+}
+func (s *stubStore) RecordContractVersion(_ context.Context, _ poller.ContractVersion) error {
+	return nil
+}
+func (s *stubStore) GetLatestContractVersion(_ context.Context, _ string) (poller.ContractVersion, error) {
+	return poller.ContractVersion{}, poller.ErrVersionNotFound
 }
 
 type stubRedis struct{}

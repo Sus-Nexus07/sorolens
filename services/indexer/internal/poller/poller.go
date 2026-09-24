@@ -155,7 +155,8 @@ func (p *Poller) processAll(ctx context.Context) error {
 	return nil
 }
 
-// processContract indexes all new events for one contract.
+// processContract indexes all new events for one contract and detects
+// Wasm hash transitions (issue #276).
 func (p *Poller) processContract(ctx context.Context, contractID, network string) error {
 	rpc, ok := p.selectRPCClient(network)
 	if !ok {
@@ -246,6 +247,20 @@ func (p *Poller) processContract(ctx context.Context, contractID, network string
 		return fmt.Errorf("upsert sync state: %w", err)
 	}
 
+	// ---- Wasm hash transition detection (issue #276) ----------------------
+	// Ask the RPC for the current Wasm hash of this contract. When it differs
+	// from the last recorded version, persist a new ContractVersion entry.
+	if wasmHash, hashErr := rpc.GetContractWasmHash(ctx, contractID); hashErr != nil {
+		// Non-fatal: a single RPC miss must not stall the rest of the indexer.
+		p.log.Warn("failed to fetch contract wasm hash, skipping version check",
+			"contract_id", contractID,
+			"err", hashErr,
+		)
+	} else if wasmHash != "" {
+		p.maybeRecordVersion(ctx, contractID, wasmHash, endLedger, invocations)
+	}
+	// -----------------------------------------------------------------------
+
 	log.Info("contract indexed",
 		"events", len(events),
 		"invocations", len(invocations),
@@ -253,6 +268,63 @@ func (p *Poller) processContract(ctx context.Context, contractID, network string
 	)
 	return nil
 }
+
+// maybeRecordVersion compares the observed wasmHash against the latest
+// recorded version and appends a new ContractVersion row when a transition is
+// detected. All errors are logged and treated as non-fatal.
+func (p *Poller) maybeRecordVersion(
+	ctx context.Context,
+	contractID, wasmHash string,
+	endLedger uint32,
+	invocations []Invocation,
+) {
+	prev, err := p.store.GetLatestContractVersion(ctx, contractID)
+	if err != nil && err != ErrVersionNotFound {
+		p.log.Warn("failed to get latest contract version",
+			"contract_id", contractID, "err", err)
+		return
+	}
+
+	// No change: the current hash matches the most recently recorded one.
+	if err == nil && prev.WasmHash == wasmHash {
+		return
+	}
+
+	cv := ContractVersion{
+		ContractID:      contractID,
+		WasmHash:        wasmHash,
+		FirstSeenLedger: int64(endLedger),
+		TxHash:          anchorTxHash(invocations),
+	}
+	if recordErr := p.store.RecordContractVersion(ctx, cv); recordErr != nil {
+		p.log.Warn("failed to record contract version",
+			"contract_id", contractID,
+			"wasm_hash", wasmHash,
+			"err", recordErr,
+		)
+		return
+	}
+	p.log.Info("new wasm hash detected, version recorded",
+		"contract_id", contractID,
+		"wasm_hash", wasmHash,
+		"first_seen_ledger", endLedger,
+	)
+}
+
+// anchorTxHash returns the TxHash of the invocation with the highest ledger,
+// which is the best-effort candidate for the upgrade transaction.
+// Returns an empty string when invocations is empty.
+func anchorTxHash(invocations []Invocation) string {
+	var best Invocation
+	for _, inv := range invocations {
+		if inv.Ledger > best.Ledger {
+			best = inv
+		}
+	}
+	return best.TxHash
+}
+
+
 
 // fetchWindow calls getEvents for [startLedger, endLedger] and fetches the
 // corresponding transactions for each unique tx hash.
