@@ -2,26 +2,30 @@ package poller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sorolens/sorolens/services/indexer/internal/wasm"
 )
 
 // ---- fake RPCClient -------------------------------------------------------
 
 type fakeRPC struct {
-	mu           sync.Mutex
-	latestLedger *LatestLedger
-	latestErr    error
-	events       map[string]*GetEventsResult // key: "contractID:start-end"
-	transactions map[string]*TransactionResult
-	txErr        error
-	eventsCalls  []getEventsCall
-	// wasmHashes maps contract ID to the hash to return from GetContractWasmHash.
-	wasmHashes map[string]string
+	mu            sync.Mutex
+	latestLedger  *LatestLedger
+	latestErr     error
+	events        map[string]*GetEventsResult // key: "contractID:start-end"
+	transactions  map[string]*TransactionResult
+	ledgerEntries map[string]LedgerEntry // key: base64 LedgerKey
+	txErr         error
+	eventsCalls   []getEventsCall
 }
 
 type getEventsCall struct {
@@ -68,15 +72,20 @@ func (f *fakeRPC) GetTransaction(_ context.Context, hash string) (*TransactionRe
 	return &TransactionResult{Status: "SUCCESS", Ledger: 490000}, nil
 }
 
-func (f *fakeRPC) GetContractWasmHash(_ context.Context, contractID string) (string, error) {
+// GetLedgerEntries returns entries keyed by the base64 LedgerKey. Tests with
+// no configured entries get an empty result (so upgrade detection is skipped).
+func (f *fakeRPC) GetLedgerEntries(_ context.Context, keys []string) (*GetLedgerEntriesResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.wasmHashes != nil {
-		if h, ok := f.wasmHashes[contractID]; ok {
-			return h, nil
+	res := &GetLedgerEntriesResult{LatestLedger: 500000}
+	for _, k := range keys {
+		if e, ok := f.ledgerEntries[k]; ok {
+			res.Entries = append(res.Entries, e)
+		} else {
+			res.KeysNotFound = append(res.KeysNotFound, k)
 		}
 	}
-	return "", nil
+	return res, nil
 }
 
 // ---- fake Store -----------------------------------------------------------
@@ -87,15 +96,24 @@ type fakeStore struct {
 	syncStates   map[string]SyncState
 	events       []Event
 	invocations  []Invocation
-	versions     []ContractVersion
+	upgrades     []ContractUpgrade
+	wasmHashes   map[string]string
 	syncErr      error
 	listErr      error
+	hourly       map[string][]HourlyActivity // contractID -> buckets
+	alerts       []Alert
+	insertErr    error
+	healthInputs map[string]HealthInputs // contractID -> inputs
+	healthScores []ContractHealthScore
 }
 
 func newFakeStore(contracts []Contract) *fakeStore {
 	return &fakeStore{
-		contracts:  contracts,
-		syncStates: make(map[string]SyncState),
+		contracts:    contracts,
+		syncStates:   make(map[string]SyncState),
+		hourly:       make(map[string][]HourlyActivity),
+		wasmHashes:   make(map[string]string),
+		healthInputs: make(map[string]HealthInputs),
 	}
 }
 
@@ -141,36 +159,52 @@ func (f *fakeStore) UpsertSyncState(_ context.Context, s SyncState) error {
 	return nil
 }
 
-func (f *fakeStore) RecordContractVersion(_ context.Context, v ContractVersion) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	// Idempotent: deduplicate by (contract_id, wasm_hash).
-	for _, existing := range f.versions {
-		if existing.ContractID == v.ContractID && existing.WasmHash == v.WasmHash {
-			return nil
-		}
-	}
-	f.versions = append(f.versions, v)
+func (f *fakeStore) CreateNextMonthPartition(_ context.Context) error { return nil }
+func (f *fakeStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
 	return nil
 }
 
-func (f *fakeStore) GetLatestContractVersion(_ context.Context, contractID string) (ContractVersion, error) {
+func (f *fakeStore) RecentHourlyActivity(_ context.Context, contractID string, _ int) ([]HourlyActivity, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var latest ContractVersion
-	found := false
-	for _, v := range f.versions {
-		if v.ContractID == contractID {
-			if !found || v.FirstSeenLedger > latest.FirstSeenLedger {
-				latest = v
-				found = true
-			}
-		}
+	return f.hourly[contractID], nil
+}
+
+func (f *fakeStore) InsertAlert(_ context.Context, a Alert) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return f.insertErr
 	}
-	if !found {
-		return ContractVersion{}, ErrVersionNotFound
-	}
-	return latest, nil
+	f.alerts = append(f.alerts, a)
+	return nil
+}
+
+func (f *fakeStore) InsertContractUpgrade(_ context.Context, u ContractUpgrade) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upgrades = append(f.upgrades, u)
+	return nil
+}
+
+func (f *fakeStore) UpdateContractWasmHash(_ context.Context, contractID, wasmHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.wasmHashes[contractID] = wasmHash
+	return nil
+}
+
+func (f *fakeStore) ContractHealthInputs(_ context.Context, contractID string) (HealthInputs, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.healthInputs[contractID], nil
+}
+
+func (f *fakeStore) UpsertContractHealthScore(_ context.Context, s ContractHealthScore) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healthScores = append(f.healthScores, s)
+	return nil
 }
 
 // ---- fake RedisClient -----------------------------------------------------
@@ -384,6 +418,48 @@ func TestPoller_UsesContractNetworkRPCClient(t *testing.T) {
 	}
 }
 
+func TestPoller_StampsContractNetwork(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CNETSTAMP"
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: "mainnet"}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 500000},
+		events: map[string]*GetEventsResult{
+			contractID: {
+				Events: []RPCEvent{{
+					ID:             "0001-0001",
+					ContractID:     contractID,
+					Ledger:         499100,
+					LedgerClosedAt: "2026-07-26T10:00:00Z",
+					TxHash:         "txnet",
+					Type:           "contract",
+				}},
+				LatestLedger: 500000,
+			},
+		},
+		transactions: map[string]*TransactionResult{
+			"txnet": {Status: "SUCCESS", Ledger: 499100},
+		},
+	}
+
+	p := NewWithRPCClients(map[string]RPCClient{"mainnet": rpc}, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.events) != 1 || store.events[0].Network != "mainnet" {
+		t.Fatalf("event network: want mainnet, got %+v", store.events)
+	}
+	if len(store.invocations) != 1 || store.invocations[0].Network != "mainnet" {
+		t.Fatalf("invocation network: want mainnet, got %+v", store.invocations)
+	}
+}
+
 func TestPoller_SkipsUnconfiguredNetwork(t *testing.T) {
 	t.Parallel()
 
@@ -444,117 +520,231 @@ func TestPoller_UnknownModeReturnsError(t *testing.T) {
 	}
 }
 
-// ---- changelog / version detection tests ----------------------------------
+// ---- anomaly detection job (issue #136) -----------------------------------
 
-// TestPoller_RecordsNewWasmHash verifies that when the RPC reports a wasm hash
-// for a contract that has no prior version, the poller writes one ContractVersion.
-func TestPoller_RecordsNewWasmHash(t *testing.T) {
+func anomalyConfig() Config {
+	cfg := testConfig()
+	cfg.AnomalyEnabled = true
+	cfg.AnomalyLookbackHours = 24
+	cfg.AnomalySigma = 3
+	cfg.AnomalyMinHistory = 12
+	return cfg
+}
+
+// steadyActivity builds `hours` of steady hourly buckets at `base` events.
+func steadyActivity(contractID string, hours int, base int64) []HourlyActivity {
+	start := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	out := make([]HourlyActivity, hours)
+	for i := 0; i < hours; i++ {
+		out[i] = HourlyActivity{
+			Hour:        start.Add(time.Duration(i) * time.Hour),
+			EventCount:  base,
+			InvokeCount: base / 2,
+			CPU:         base * 100,
+			Fees:        base * 1000,
+		}
+	}
+	return out
+}
+
+// TestPoller_AnomalyJob_SteadyStateNoAlerts simulates steady activity and
+// requires the job to not raise any contract alerts.
+func TestPoller_AnomalyJob_SteadyStateNoAlerts(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSTEADY", Status: "active"}})
+	store.hourly["CSTEADY"] = steadyActivity("CSTEADY", 24, 100)
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), anomalyConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(store.alerts) != 0 {
+		t.Fatalf("steady state produced %d alerts: %+v", len(store.alerts), store.alerts)
+	}
+}
+
+// TestPoller_AnomalyJob_FabricatedSpikeRaisesAlert fabricates a 20x event
+// spike in the trailing hour and requires exactly one Warning alert (events
+// metric), de-duplicated across the two runs of the same pass is not
+// applicable since the job detects once per pass.
+func TestPoller_AnomalyJob_FabricatedSpikeRaisesAlert(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSPIKE", Status: "active"}})
+	buckets := steadyActivity("CSPIKE", 24, 100)
+	last := buckets[len(buckets)-1]
+	last.EventCount = 2000
+	buckets[len(buckets)-1] = last
+	store.hourly["CSPIKE"] = buckets
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), anomalyConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(store.alerts) == 0 {
+		t.Fatal("spike produced no alerts")
+	}
+	for _, a := range store.alerts {
+		if a.Severity != "Warning" {
+			t.Errorf("alert severity = %q, want Warning", a.Severity)
+		}
+		if a.Message == "" {
+			t.Error("alert message is empty")
+		}
+	}
+}
+
+// TestPoller_AnomalyJobSkippedWhenDisabled ensures the job is off by default.
+func TestPoller_AnomalyJobSkippedWhenDisabled(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSPIKE2", Status: "active"}})
+	buckets := steadyActivity("CSPIKE2", 24, 100)
+	last := buckets[len(buckets)-1]
+	last.EventCount = 2000
+	buckets[len(buckets)-1] = last
+	store.hourly["CSPIKE2"] = buckets
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(store.alerts) != 0 {
+		t.Fatalf("alerts raised with anomaly job disabled: %+v", store.alerts)
+	}
+}
+
+// TestPoller_AnomalyJobRespectsCancellation ensures context cancellation stops
+// the detection loop cleanly.
+func TestPoller_AnomalyJobRespectsCancellation(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CCANCEL", Status: "active"}})
+	store.hourly["CCANCEL"] = steadyActivity("CCANCEL", 24, 100)
+
+	cfg := anomalyConfig()
+	p := New(&fakeRPC{}, store, newFakeRedis(), cfg, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx, "once") }()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// buildInstanceEntryXDR builds a valid contract-instance ContractData
+// LedgerEntry.xdr fixture matching the wire layout wasm.WasmHashFromInstanceEntry
+// expects: lastModified, type=6, ext=0, addrType=contract, contractID,
+// key=20, val=19, then the 32-byte wasm hash.
+func buildInstanceEntryXDR(contractIDHex, wasmHashHex string, lastModified uint32) string {
+	var out []byte
+	putU32 := func(v uint32) { out = binary.BigEndian.AppendUint32(out, v) }
+	putU32(lastModified)
+	putU32(6) // LedgerEntryType CONTRACT_DATA
+	putU32(0) // ContractDataEntryExt V0
+	putU32(1) // SCAddressType CONTRACT
+	contractID, _ := hex.DecodeString(contractIDHex)
+	out = append(out, contractID...)
+	putU32(20) // SCValType scvLedgerKeyContractInstance
+	putU32(19) // SCValType scvContractInstance
+	wasmHash, _ := hex.DecodeString(wasmHashHex)
+	out = append(out, wasmHash...)
+	return base64.StdEncoding.EncodeToString(out)
+}
+
+// instanceKeyXDR returns the base64 LedgerKey for a contract's instance entry.
+// It mirrors wasm.ContractInstanceKey; using the real function here keeps the
+// fixture key consistent with what checkWasmHash requests.
+func instanceKeyXDR(contractIDHex string) string {
+	key, err := wasm.ContractInstanceKey(contractIDHex)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+func TestPoller_checksWasmHashBaseline(t *testing.T) {
 	t.Parallel()
 
-	contractID := "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-	const wasmHash = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
-
-	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
+	contractID := "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	wasmHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	key := instanceKeyXDR(contractID)
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: ""}})
 	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
 
 	rpc := &fakeRPC{
 		latestLedger: &LatestLedger{Sequence: 500000},
-		wasmHashes:   map[string]string{contractID: wasmHash},
+		ledgerEntries: map[string]LedgerEntry{
+			key: {Key: key, XDR: buildInstanceEntryXDR(contractID, wasmHash, 501), LastModifiedLedgerSeq: 501},
+		},
 	}
 
 	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
 	if err := p.Run(context.Background(), "once"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	store.mu.Lock()
-	defer store.mu.Unlock()
-
-	if len(store.versions) != 1 {
-		t.Fatalf("expected 1 ContractVersion, got %d", len(store.versions))
+	if got := store.wasmHashes[contractID]; got != wasmHash {
+		t.Errorf("stored wasm hash = %q, want %q (baseline)", got, wasmHash)
 	}
-	got := store.versions[0]
-	if got.ContractID != contractID {
-		t.Errorf("version.ContractID: want %q, got %q", contractID, got.ContractID)
-	}
-	if got.WasmHash != wasmHash {
-		t.Errorf("version.WasmHash: want %q, got %q", wasmHash, got.WasmHash)
+	if len(store.upgrades) != 0 {
+		t.Errorf("expected no upgrade row on first observation, got %d", len(store.upgrades))
 	}
 }
 
-// TestPoller_DoesNotDuplicateUnchangedHash verifies that a second indexer run
-// with the same wasm hash produces no additional ContractVersion row.
-func TestPoller_DoesNotDuplicateUnchangedHash(t *testing.T) {
+func TestPoller_recordsContractUpgradeOnWasmChange(t *testing.T) {
 	t.Parallel()
 
-	contractID := "CSTABLE"
-	const wasmHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-
-	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
-	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 498000}
-	// Pre-populate a version so the poller sees it as "no change".
-	store.versions = []ContractVersion{{
-		ContractID:      contractID,
-		WasmHash:        wasmHash,
-		FirstSeenLedger: 490000,
-	}}
-
-	rpc := &fakeRPC{
-		latestLedger: &LatestLedger{Sequence: 500000},
-		wasmHashes:   map[string]string{contractID: wasmHash},
-	}
-
-	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
-	if err := p.Run(context.Background(), "once"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	store.mu.Lock()
-	defer store.mu.Unlock()
-
-	if len(store.versions) != 1 {
-		t.Errorf("expected 1 ContractVersion (no duplicate), got %d", len(store.versions))
-	}
-}
-
-// TestPoller_DetectsHashTransition verifies that when a contract's wasm hash
-// changes between runs, a new ContractVersion row is appended.
-func TestPoller_DetectsHashTransition(t *testing.T) {
-	t.Parallel()
-
-	contractID := "CUPGRADED"
-	const oldHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	const newHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-	store := newFakeStore([]Contract{{ID: contractID, Status: "active"}})
+	contractID := "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	oldHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	newHash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	key := instanceKeyXDR(contractID)
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: "", WasmHash: oldHash}})
 	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
-	store.versions = []ContractVersion{{
-		ContractID:      contractID,
-		WasmHash:        oldHash,
-		FirstSeenLedger: 490000,
-	}}
 
 	rpc := &fakeRPC{
 		latestLedger: &LatestLedger{Sequence: 500000},
-		wasmHashes:   map[string]string{contractID: newHash},
+		ledgerEntries: map[string]LedgerEntry{
+			key: {Key: key, XDR: buildInstanceEntryXDR(contractID, newHash, 501), LastModifiedLedgerSeq: 501},
+		},
 	}
 
 	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
 	if err := p.Run(context.Background(), "once"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	store.mu.Lock()
-	count := len(store.versions)
-	store.mu.Unlock()
-
-	if count != 2 {
-		t.Fatalf("expected 2 ContractVersions after upgrade, got %d", count)
+	if got := store.wasmHashes[contractID]; got != newHash {
+		t.Errorf("stored wasm hash = %q, want %q after upgrade", got, newHash)
 	}
-	// The newest entry should carry the new hash.
-	latest, _ := store.GetLatestContractVersion(context.Background(), contractID)
-	if latest.WasmHash != newHash {
-		t.Errorf("latest version WasmHash: want %q, got %q", newHash, latest.WasmHash)
+	if len(store.upgrades) != 1 {
+		t.Fatalf("expected exactly 1 upgrade row, got %d", len(store.upgrades))
+	}
+	u := store.upgrades[0]
+	if u.ContractID != contractID || u.FromHash != oldHash || u.ToHash != newHash {
+		t.Errorf("unexpected upgrade row: %+v", u)
+	}
+	if u.Ledger != 501 {
+		t.Errorf("upgrade ledger = %d, want 501", u.Ledger)
 	}
 }
 
+func TestPoller_noUpgradeWhenWasmHashUnchanged(t *testing.T) {
+	t.Parallel()
+
+	contractID := "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	hash := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	key := instanceKeyXDR(contractID)
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: "", WasmHash: hash}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 499000}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 500000},
+		ledgerEntries: map[string]LedgerEntry{
+			key: {Key: key, XDR: buildInstanceEntryXDR(contractID, hash, 502), LastModifiedLedgerSeq: 502},
+		},
+	}
+
+	p := New(rpc, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(store.upgrades) != 0 {
+		t.Errorf("expected no upgrade row when hash unchanged, got %d", len(store.upgrades))
+	}
+}

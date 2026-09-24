@@ -11,11 +11,7 @@ type RPCClient interface {
 	GetLatestLedger(ctx context.Context) (*LatestLedger, error)
 	GetEvents(ctx context.Context, startLedger, endLedger uint32, filters []EventFilter) (*GetEventsResult, error)
 	GetTransaction(ctx context.Context, hash string) (*TransactionResult, error)
-	// GetContractWasmHash returns the current Wasm hash for the given contract
-	// by reading the ContractInstance ledger entry. Returns an empty string
-	// when the contract exists but its Wasm hash cannot be determined, and an
-	// error only on hard RPC/transport failures.
-	GetContractWasmHash(ctx context.Context, contractID string) (string, error)
+	GetLedgerEntries(ctx context.Context, keys []string) (*GetLedgerEntriesResult, error)
 }
 
 
@@ -27,12 +23,29 @@ type Store interface {
 	BatchInsertInvocations(ctx context.Context, invocations []Invocation) error
 	GetSyncState(ctx context.Context, contractID string) (SyncState, error)
 	UpsertSyncState(ctx context.Context, s SyncState) error
-	// RecordContractVersion persists a detected Wasm hash transition.
-	// Implementations must be idempotent for duplicate (contractID, wasmHash) pairs.
-	RecordContractVersion(ctx context.Context, v ContractVersion) error
-	// GetLatestContractVersion returns the most recently recorded ContractVersion
-	// for the given contractID, or (ContractVersion{}, ErrVersionNotFound) if none.
-	GetLatestContractVersion(ctx context.Context, contractID string) (ContractVersion, error)
+	CreateNextMonthPartition(ctx context.Context) error
+	CreateMonthlyPartitionIfNotExists(ctx context.Context, year int, month int) error
+
+	// RecentHourlyActivity returns per-hour activity buckets for the most
+	// recent `hours` hours (oldest first), aggregated across events and
+	// invocations. Used by the anomaly detector to build a rolling baseline.
+	RecentHourlyActivity(ctx context.Context, contractID string, hours int) ([]HourlyActivity, error)
+	// InsertAlert persists an anomaly/health alert row (severity Warning for
+	// anomaly spikes). Implementations may de-duplicate on (tx_hash,
+	// contract_id).
+	InsertAlert(ctx context.Context, a Alert) error
+	// InsertContractUpgrade records a Wasm-hash change for a contract. The
+	// store is responsible for ignoring duplicate (contract, tx) rows.
+	InsertContractUpgrade(ctx context.Context, u ContractUpgrade) error
+	// UpdateContractWasmHash records the now-current on-chain Wasm hash for a
+	// contract so subsequent polls can diff against it.
+	UpdateContractWasmHash(ctx context.Context, contractID, wasmHash string) error
+
+	// ContractHealthInputs aggregates the raw signals that feed the composite
+	// health score (issue #137). It never errors on empty data.
+	ContractHealthInputs(ctx context.Context, contractID string) (HealthInputs, error)
+	// UpsertContractHealthScore caches a computed 0-100 health score.
+	UpsertContractHealthScore(ctx context.Context, h ContractHealthScore) error
 }
 
 // RedisClient is the subset of Redis operations the poller needs for advisory locks.
@@ -91,17 +104,51 @@ type TransactionResult struct {
 	ResourceFee      int64
 }
 
+// LedgerEntry mirrors soroban.LedgerEntry.
+type LedgerEntry struct {
+	// Key is the base64-encoded LedgerKey that was requested.
+	Key string
+	// XDR is the base64-encoded LedgerEntry from getLedgerEntries.
+	XDR string
+	// LastModifiedLedgerSeq is the most recent ledger in which the entry
+	// was modified.
+	LastModifiedLedgerSeq uint32
+}
+
+// GetLedgerEntriesResult mirrors soroban.GetLedgerEntriesResult.
+type GetLedgerEntriesResult struct {
+	Entries        []LedgerEntry
+	LatestLedger   uint32
+	KeysNotFound   []string
+	DuplicatedKeys []string
+}
+
+// WasmHashResult mirrors soroban.GetWasmHashResult.
+
+// ContractUpgrade mirrors store.ContractUpgrade.
+type ContractUpgrade struct {
+	ContractID string
+	FromHash   string
+	ToHash     string
+	Ledger     uint32
+	TxHash     string
+	At         time.Time
+}
+
 // Contract mirrors store.Contract (fields the poller needs).
 type Contract struct {
-	ID     string
-	Status string
+	ID      string
+	Status  string
 	Network string
+	// WasmHash is the current on-chain Wasm hash the poller last observed.
+	WasmHash string
 }
 
 // Event mirrors store.Event.
 type Event struct {
 	ID               string
 	ContractID       string
+	Network          string
 	Ledger           uint32
 	LedgerClosedAt   time.Time
 	TxHash           string
@@ -115,6 +162,7 @@ type Event struct {
 type Invocation struct {
 	TxHash           string
 	ContractID       string
+	Network          string
 	Ledger           uint32
 	LedgerClosedAt   time.Time
 	Status           string
@@ -128,19 +176,48 @@ type SyncState struct {
 	LastLedger uint32
 }
 
-// ContractVersion mirrors store.ContractVersion.
-type ContractVersion struct {
-	ContractID        string
-	WasmHash          string
-	FirstSeenLedger   int64
-	TxHash            string
-	VerifiedSourceRef string
+// HourlyActivity is one per-hour aggregate bucket for a contract, used by the
+// anomaly detector. CPU and fees are totals over the hour.
+type HourlyActivity struct {
+	Hour        time.Time // bucket start, UTC
+	EventCount  int64
+	InvokeCount int64
+	CPU         int64 // sum of cpu_insn
+	Fees        int64 // sum of resource fees, stroops
 }
 
-// ErrVersionNotFound is returned by GetLatestContractVersion when no entry exists.
-var ErrVersionNotFound = errorString("poller: contract version not found")
+// Alert mirrors store.ContractAlert. TxHash carries a synthetic, deterministic
+// key (see anomaly job) so implementations can de-duplicate re-runs.
+type Alert struct {
+	ContractID string
+	Severity   string // Info | Warning | Critical
+	Message    string
+	Ledger     int64
+	TxHash     string
+	Timestamp  time.Time
+}
 
-// errorString is a trivial error type so the package has no external deps.
-type errorString string
+// HealthInputs mirrors store.HealthScoreInputs (issue #137). It carries the
+// raw aggregates an implementation gathers so the pure healthscore package can
+// compute the composite score without importing apps/api.
+type HealthInputs struct {
+	HealthyChecks     int64
+	TotalChecks       int64
+	WatchdogStatus    string
+	TotalInvocations  int64
+	FailedInvocations int64
+	Activity          []HourlyActivity
+	TotalStorage      int64
+	ExpiringStorage   int64
+}
 
-func (e errorString) Error() string { return string(e) }
+// ContractHealthScore mirrors store.ContractHealthScore.
+type ContractHealthScore struct {
+	ContractID           string
+	Score                int32
+	ComponentUptime      int32
+	ComponentErrorRate   int32
+	ComponentPerformance int32
+	ComponentStorageTTL  int32
+	ComputedAt           time.Time
+}

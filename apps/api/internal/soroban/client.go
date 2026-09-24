@@ -1,3 +1,19 @@
+// Package soroban provides a typed JSON-RPC 2.0 client for the Stellar
+// Soroban RPC. It wraps the getLatestLedger, getEvents, getLedgerEntries,
+// getTransaction, and getNetwork methods with automatic retry on HTTP 5xx
+// and 429 (rate limit) responses using exponential backoff with jitter.
+//
+// # Retention window
+//
+// The public SDF RPC endpoints retain events for approximately 24 hours
+// and transaction data for up to 7 days (about 100,000 ledgers at 5-6
+// seconds per ledger). Because of this 7-day retention window, a newly
+// tracked contract cannot backfill its full history; the earliest
+// queryable startLedger is max(latestLedger - 100_000, 1). Passing a
+// startLedger below the oldestLedger returned by the RPC will result in
+// an error.
+//
+// See RESEARCH.md section 1.2 for the full retention specification.
 package soroban
 
 import (
@@ -8,6 +24,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"time"
 )
 
@@ -33,7 +50,7 @@ func New(endpoint string, timeout time.Duration) *Client {
 	}
 	return &Client{
 		endpoint:   endpoint,
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)},
 		timeout:    timeout,
 	}
 }
