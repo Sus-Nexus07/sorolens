@@ -12,13 +12,7 @@ import Link from "next/link";
 import { NetworkProvider } from "@/lib/network";
 import { NetworkSelector } from "@/components/NetworkSelector";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
-import { ThemeToggle } from "@/components/ThemeToggle";
-import { OfflineBanner } from "@/components/OfflineAlert";
-import { PushSubscribeButton } from "@/components/PushSubscribeButton";
-import { useOfflineAlertQueue } from "@/hooks/useOfflineAlertQueue";
-
-function AppLayoutInner({ children }: { children: React.ReactNode }) {
-  const { isOffline, pending } = useOfflineAlertQueue();
+import { CmdkSearch } from "@/components/CmdkSearch";
 
   return (
     <>
