@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"time"
@@ -24,6 +25,7 @@ type MockStore struct {
 	alertSubscriptions []AlertSubscription
 	users              map[string]User
 	healthScores       map[string]ContractHealthScore
+	indexerCursors     map[string]uint32
 
 	// Error injection
 	UpsertContractErr   error
@@ -53,6 +55,7 @@ func NewMockStore() *MockStore {
 		alerts:             make([]ContractAlert, 0),
 		alertSubscriptions: make([]AlertSubscription, 0),
 		users:              make(map[string]User),
+		indexerCursors:     make(map[string]uint32),
 	}
 }
 
@@ -155,6 +158,36 @@ func (m *MockStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, 
 	return nil
 }
 
+func (m *MockStore) GetIndexerCursor(_ context.Context, network string) (uint32, error) {
+	if m.indexerCursors == nil {
+		return 0, nil
+	}
+	return m.indexerCursors[networkOrDefault(network)], nil
+}
+
+func (m *MockStore) SetIndexerCursor(_ context.Context, network string, ledger uint32) error {
+	if m.indexerCursors == nil {
+		m.indexerCursors = make(map[string]uint32)
+	}
+	m.indexerCursors[networkOrDefault(network)] = ledger
+	return nil
+}
+
+func (m *MockStore) BatchInsertWithCursor(ctx context.Context, network string, ledger uint32, events []Event, invocations []Invocation, syncState SyncState) error {
+	if err := m.BatchInsertEvents(ctx, events); err != nil {
+		return err
+	}
+	if err := m.BatchInsertInvocations(ctx, invocations); err != nil {
+		return err
+	}
+	if syncState.ContractID != "" {
+		if err := m.UpsertSyncState(ctx, syncState); err != nil {
+			return err
+		}
+	}
+	return m.SetIndexerCursor(ctx, network, ledger)
+}
+
 // ---- store.QueryStore -------------------------------------------------------
 
 func (m *MockStore) ListEvents(_ context.Context, contractID, cursor string, limit int, f EventFilters) ([]Event, string, error) {
@@ -178,6 +211,9 @@ func (m *MockStore) ListEvents(_ context.Context, contractID, cursor string, lim
 		if f.Type != "" && e.Type != f.Type {
 			continue
 		}
+		if f.Topic != "" && !topicDecodedContains(e.TopicDecoded, f.Topic) {
+			continue
+		}
 		out = append(out, e)
 		if len(out) > limit {
 			break
@@ -189,6 +225,29 @@ func (m *MockStore) ListEvents(_ context.Context, contractID, cursor string, lim
 		out = out[:limit]
 	}
 	return out, nextCursor, nil
+}
+
+// topicDecodedContains reports whether a decoded topic list contains the value
+// encoded by a ?topic= filter. Comparison goes through JSON so an int in test
+// data matches the float64 produced by decoding a numeric filter, mirroring the
+// containment semantics of postgresStore.ListEvents.
+func topicDecodedContains(topics []any, topic string) bool {
+	want := topicFilterValue(topic)
+	for _, t := range topics {
+		if jsonValueEqual(t, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonValueEqual(a, b any) bool {
+	ab, errA := json.Marshal(a)
+	bb, errB := json.Marshal(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return string(ab) == string(bb)
 }
 
 func (m *MockStore) ListInvocations(_ context.Context, contractID, cursor string, limit int, f InvocationFilters) ([]Invocation, string, error) {
