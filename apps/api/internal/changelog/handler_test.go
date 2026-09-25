@@ -39,7 +39,7 @@ func (f *fakeStore) GetContract(_ context.Context, id string) (store.Contract, e
 	return store.Contract{}, store.ErrNotFound
 }
 
-func (f *fakeStore) ListContracts(_ context.Context, _ string, _ int) ([]store.Contract, string, error) {
+func (f *fakeStore) ListContracts(_ context.Context, _ string, _ int, _ store.ContractFilters) ([]store.Contract, string, error) {
 	return f.contracts, "", nil
 }
 
@@ -61,6 +61,24 @@ func (f *fakeStore) UpsertSyncState(_ context.Context, _ store.SyncState) error 
 
 func (f *fakeStore) GetGlobalStats(_ context.Context) (store.GlobalStats, error) {
 	return store.GlobalStats{}, nil
+}
+
+func (f *fakeStore) CreateNextMonthPartition(_ context.Context) error { return nil }
+
+func (f *fakeStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
+	return nil
+}
+
+func (f *fakeStore) GetIndexerCursor(_ context.Context, _ string) (uint32, error) {
+	return 0, nil
+}
+
+func (f *fakeStore) SetIndexerCursor(_ context.Context, _ string, _ uint32) error {
+	return nil
+}
+
+func (f *fakeStore) BatchInsertWithCursor(_ context.Context, _ string, _ uint32, _ []store.Event, _ []store.Invocation, _ store.SyncState) error {
+	return nil
 }
 
 func (f *fakeStore) RecordContractVersion(_ context.Context, v store.ContractVersion) error {
