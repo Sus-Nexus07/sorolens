@@ -1,22 +1,8 @@
-"use client";
-
-/**
- * App-shell layout for all dashboard routes (/(app)/...).
- *
- * - Mounts useOfflineAlertQueue so alerts can be captured while offline.
- * - Renders OfflineBanner at the top when offline.
- * - Renders PushSubscribeButton in the header so the user can opt in to
- *   Web Push at any time.
- */
+import { ThemeToggle } from "@/components/ThemeToggle";
 import Link from "next/link";
 import { NetworkProvider } from "@/lib/network";
 import { NetworkSelector } from "@/components/NetworkSelector";
-import { OfflineBanner } from "@/components/OfflineAlert";
-import { PushSubscribeButton } from "@/components/PushSubscribeButton";
-import { useOfflineAlertQueue } from "@/hooks/useOfflineAlertQueue";
-
-function AppLayoutInner({ children }: { children: React.ReactNode }) {
-  const { isOffline, pending } = useOfflineAlertQueue();
+import { Breadcrumbs } from "@/components/Breadcrumbs";
 
   return (
     <>
@@ -39,6 +25,12 @@ function AppLayoutInner({ children }: { children: React.ReactNode }) {
                 Contracts
               </Link>
               <Link
+                href="/events"
+                className="text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
+              >
+                Events
+              </Link>
+              <Link
                 href="/watchdog"
                 className="text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
               >
@@ -52,10 +44,14 @@ function AppLayoutInner({ children }: { children: React.ReactNode }) {
               </Link>
             </nav>
             <NetworkSelector />
-            <PushSubscribeButton />
+            <ThemeToggle />
           </div>
         </header>
+        <Breadcrumbs />
         <main>{children}</main>
+        <footer className="mt-12 border-t border-[var(--color-border)] pt-6 text-sm text-[var(--color-text-secondary)]">
+          Built for the Stellar developer community.
+        </footer>
       </div>
     </>
   );
