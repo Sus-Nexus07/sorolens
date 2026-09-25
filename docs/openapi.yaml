@@ -1377,6 +1377,35 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/v1/watchdog/contracts/{id}/uptime:
+    get:
+      tags: [Watchdog]
+      summary: Get uptime percentage for a monitored contract
+      operationId: getContractUptime
+      security:
+        - ApiKeyAuth: [read:watchdog]
+      parameters:
+        - $ref: "#/components/parameters/ContractID"
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [24h, 7d, 30d]
+            default: 24h
+          description: Time window over which to compute uptime (default 24h).
+      responses:
+        "200":
+          description: Uptime statistics for the specified window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UptimeResult"
+        "422":
+          $ref: "#/components/responses/InvalidInput"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /api/v1/watchdog/subscriptions:
     get:
       tags: [Notifications]
