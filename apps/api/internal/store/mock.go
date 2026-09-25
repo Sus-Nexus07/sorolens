@@ -28,21 +28,22 @@ type MockStore struct {
 	indexerCursors     map[string]uint32
 
 	// Error injection
-	UpsertContractErr   error
-	GetContractErr      error
-	ListContractsErr    error
-	GetGlobalStatsErr   error
-	ListEventsErr       error
-	ListInvocationsErr  error
-	ListStorageErr      error
-	GetContractStatsErr error
-	RecentEventsErr     error
-	CreateAPIKeyErr     error
-	GetAPIKeyErr        error
-	UpsertUserErr       error
-	GetUserErr          error
-	ListUpgradesErr     error
-	GetHealthScoreErr   error
+	UpsertContractErr    error
+	GetContractErr       error
+	ListContractsErr     error
+	GetGlobalStatsErr    error
+	ListEventsErr        error
+	ListInvocationsErr   error
+	ListStorageErr       error
+	GetContractStatsErr  error
+	RecentEventsErr      error
+	RecentInvocationsErr error
+	CreateAPIKeyErr      error
+	GetAPIKeyErr         error
+	UpsertUserErr        error
+	GetUserErr           error
+	ListUpgradesErr      error
+	GetHealthScoreErr    error
 }
 
 // NewMockStore returns an initialized MockStore.
@@ -450,6 +451,24 @@ func (m *MockStore) RecentEvents(_ context.Context, contractID string, limit int
 	return out, nil
 }
 
+// RecentInvocations returns the newest invocations for a contract, mirroring
+// the postgres query's ledger/tx-hash descending order.
+func (m *MockStore) RecentInvocations(_ context.Context, contractID string, limit int) ([]Invocation, error) {
+	if m.RecentInvocationsErr != nil {
+		return nil, m.RecentInvocationsErr
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	var out []Invocation
+	for i := len(m.invocations) - 1; i >= 0 && len(out) < limit; i-- {
+		if m.invocations[i].ContractID == contractID {
+			out = append(out, m.invocations[i])
+		}
+	}
+	return out, nil
+}
+
 // ---- store.QueryStore snapshot helpers --------------------------------------
 
 // ContractFirstLedger returns the earliest ledger with indexed data for the
@@ -604,6 +623,7 @@ func (m *MockStore) TouchAPIKey(_ context.Context, id string) error {
 // ---- store.AlertSubscriptionStore -------------------------------------------
 
 func (m *MockStore) Create(_ context.Context, s AlertSubscription) error {
+	s.ChannelType = channelOrDefault(s.ChannelType)
 	m.alertSubscriptions = append(m.alertSubscriptions, s)
 	return nil
 }
@@ -624,6 +644,9 @@ func (m *MockStore) Delete(_ context.Context, id string) error {
 		if s.ID != id {
 			filtered = append(filtered, s)
 		}
+	}
+	if len(filtered) == len(m.alertSubscriptions) {
+		return ErrNotFound
 	}
 	m.alertSubscriptions = filtered
 	return nil
