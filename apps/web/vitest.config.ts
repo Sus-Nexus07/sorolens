@@ -7,6 +7,9 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: false,
+    setupFiles: ["./vitest.setup.ts"],
+    // Exclude Playwright e2e tests from the vitest run
+    exclude: ["tests/e2e/**", "**/node_modules/**"],
   },
   resolve: {
     alias: {
@@ -16,3 +19,4 @@ export default defineConfig({
     },
   },
 });
+

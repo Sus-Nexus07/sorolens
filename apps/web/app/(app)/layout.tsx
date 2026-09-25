@@ -1,10 +1,26 @@
+"use client";
+
+/**
+ * App-shell layout for all dashboard routes (/(app)/...).
+ *
+ * - Mounts useOfflineAlertQueue so alerts can be captured while offline.
+ * - Renders OfflineBanner at the top when offline.
+ * - Renders PushSubscribeButton in the header so the user can opt in to
+ *   Web Push at any time.
+ */
 import Link from "next/link";
 import { NetworkProvider } from "@/lib/network";
 import { NetworkSelector } from "@/components/NetworkSelector";
+import { OfflineBanner } from "@/components/OfflineAlert";
+import { PushSubscribeButton } from "@/components/PushSubscribeButton";
+import { useOfflineAlertQueue } from "@/hooks/useOfflineAlertQueue";
 
-export default function AppLayout({ children }: { children: React.ReactNode }) {
+function AppLayoutInner({ children }: { children: React.ReactNode }) {
+  const { isOffline, pending } = useOfflineAlertQueue();
+
   return (
-    <NetworkProvider>
+    <>
+      <OfflineBanner isOffline={isOffline} pendingCount={pending.length} />
       <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
         <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
           <Link
@@ -36,10 +52,19 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               </Link>
             </nav>
             <NetworkSelector />
+            <PushSubscribeButton />
           </div>
         </header>
         <main>{children}</main>
       </div>
+    </>
+  );
+}
+
+export default function AppLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <NetworkProvider>
+      <AppLayoutInner>{children}</AppLayoutInner>
     </NetworkProvider>
   );
 }
