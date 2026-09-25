@@ -1,8 +1,24 @@
-import { ThemeToggle } from "@/components/ThemeToggle";
+"use client";
+
+/**
+ * App-shell layout for all dashboard routes (/(app)/...).
+ *
+ * - Mounts useOfflineAlertQueue so alerts can be captured while offline.
+ * - Renders OfflineBanner at the top when offline.
+ * - Renders PushSubscribeButton in the header so the user can opt in to
+ *   Web Push at any time.
+ */
 import Link from "next/link";
 import { NetworkProvider } from "@/lib/network";
 import { NetworkSelector } from "@/components/NetworkSelector";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { OfflineBanner } from "@/components/OfflineAlert";
+import { PushSubscribeButton } from "@/components/PushSubscribeButton";
+import { useOfflineAlertQueue } from "@/hooks/useOfflineAlertQueue";
+
+function AppLayoutInner({ children }: { children: React.ReactNode }) {
+  const { isOffline, pending } = useOfflineAlertQueue();
 
   return (
     <>
@@ -44,6 +60,7 @@ import { Breadcrumbs } from "@/components/Breadcrumbs";
               </Link>
             </nav>
             <NetworkSelector />
+            <PushSubscribeButton />
             <ThemeToggle />
           </div>
         </header>

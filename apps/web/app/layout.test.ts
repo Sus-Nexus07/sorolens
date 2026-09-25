@@ -29,7 +29,8 @@ describe("apple-touch-icon (#220)", () => {
   });
 
   it("is referenced from the root layout metadata", () => {
-    expect(metadata.icons?.apple).toEqual([
+    const icons = metadata.icons as { apple?: unknown } | null | undefined;
+    expect(icons?.apple).toEqual([
       { url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" },
     ]);
   });
